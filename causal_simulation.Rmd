@@ -1,0 +1,119 @@
+---
+title: "Simulation 1"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+sample.size <- 1000
+set.seed(222)
+x <- replicate(10, rnorm(sample.size,0,1))
+error <- rnorm(sample.size, 0, 5)
+data <- cbind(x, error)
+colnames(data) <- c("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "error")
+
+
+```
+
+```{r}
+library(tidyverse)
+library(broom)
+library(rsample)
+library(ggdag)
+library(survey)
+library(tableone)
+library(tinytex)
+library(mvtnorm)
+#devtools::install_github('osofr/simcausal', build_vignettes = FALSE)
+library(simcausal)
+library(rpart)
+library(randomForest)
+```
+
+I begin by simulating a fairly simple causal effect model. Let Y denote the response variable, $Z_1, Z_2$ denote covariate predictor variables, and $X$ denote a treatment indicator variable. Let $(Z_1, Z_2), U, V$ be independent, 
+
+Response/predictor relationship: 
+
+$Y = a + bX + c_1 Z_1 + c_2 Z_2 + dU$
+
+Treatment assignment model: 
+
+\begin{equation}
+X = 
+  \begin{cases}
+  1, & \text{if} \ e + f_1Z_1 + f_2Z_2 + V > 0 \\
+  0, & \text{else}
+  \end{cases}
+\end{equation}
+
+```{r}
+dag <- DAG.empty() + 
+  node(c("Z1", "Z2"), distr = "mvtnorm::rmvnorm", asis.params = list(mean="c(0.5,1)", sigma = "matrix(c(2,1,1,1), ncol=2)")) + 
+  node("U", distr = "rnorm", mean = 0, sd = 1) + 
+  node("V", distr = "rnorm", mean = 0, sd = 1) + 
+  node("X", distr = "rbern", prob = plogis(0.5 + 0.25*Z1 + 0.75*Z2 + V)) + 
+  node("Y", distr = "rconst", const = 1 + X + 0.1*Z1 + 2*Z2 + U)
+
+dag <- set.DAG(dag)
+sim1.data <- sim(dag, n=1000)
+```
+In the case of simulations, we know the relationships between variables prior to creating a model. As such, we can visualize the underlying variable relationships through a DAG. 
+
+```{r}
+sim1.dag <- dagify(X ~ Z1 + Z2 + V, Y ~ X + Z1 + Z2 + U, exposure = "X", outcome = "Y")
+
+sim1.dag.viz <- sim1.dag %>% 
+  ggdag() + 
+  labs(title = "Simulation 1 DAG")
+
+```
+
+We begin by visualizing the data. 
+
+```{r}
+sim1.data %>% 
+  ggplot(aes(Y, fill = factor(X))) + 
+  geom_vline(xintercept = 0) + 
+  geom_density(color = "white", alpha = 0.75, size = 0.5) + 
+  scale_fill_manual(values = c("red", "blue")) + 
+  theme_minimal() + 
+  labs(x = "Y value", fill = "X value (0 or 1)", title = "Initial Distribution of Treatment Assignment")
+```
+Now, I will pretend as though I do not know the mechanism behind treatment assigment. I will first use logistic regression to estimate the probability of treatment assignment. 
+
+```{r}
+# logistic regression
+logistic.regression <- glm(X ~ Z1 + I(Z1^2) + Z2 + I(Z2^2) + V + I(V^2), 
+                           family = "binomial", 
+                           data = sim1.data)
+sim1.data <- sim1.data %>% 
+  mutate(logreg.fitted = logistic.regression$fitted.values)
+```
+```{r CART}
+regression.tree <- rpart(X ~ Z1 + I(Z1^2) + Z2 + I(Z2^2) + V + I(V^2), data = sim1.data, method = "class")
+predictions <- predict(regression.tree, type = "prob")[,2]
+
+sim1.data <- sim1.data %>% 
+  mutate(regtree.fitted = predictions)
+```
+```{r random forest}
+preds <- sim1.data[,c(2,3,5)]
+resp <- as.factor(sim1.data[,6])
+
+tune.rf <- tuneRF(preds, resp, stepFactor = 2, ntreeTry = 500)
+# optimal: mtry = 1
+
+random.forest <- randomForest(as.factor(X) ~ Z1 + I(Z1^2) + Z2 + I(Z2^2) + V + I(V^2), data = sim1.data, ntrees = 500, mtry = 1)
+
+rf.predictions <- predict(random.forest, type = "prob")[,2]
+
+sim1.data <- sim1.data %>% 
+  mutate(rf.fitted = rf.predictions)
+```
+```{r}
+
+```
+
