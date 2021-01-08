@@ -8,17 +8,6 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r}
-sample.size <- 1000
-set.seed(222)
-x <- replicate(10, rnorm(sample.size,0,1))
-error <- rnorm(sample.size, 0, 5)
-data <- cbind(x, error)
-colnames(data) <- c("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "error")
-
-
-```
-
-```{r}
 library(tidyverse)
 library(broom)
 library(rsample)
@@ -31,6 +20,8 @@ library(mvtnorm)
 library(simcausal)
 library(rpart)
 library(randomForest)
+library(gbm)
+library(caret)
 ```
 
 I begin by simulating a fairly simple causal effect model. Let Y denote the response variable, $Z_1, Z_2$ denote covariate predictor variables, and $X$ denote a treatment indicator variable. Let $(Z_1, Z_2), U, V$ be independent, 
@@ -58,7 +49,8 @@ dag <- DAG.empty() +
   node("Y", distr = "rconst", const = 1 + X + 0.1*Z1 + 2*Z2 + U)
 
 dag <- set.DAG(dag)
-sim1.data <- sim(dag, n=1000)
+sample.size <- 1000
+sim1.data <- sim(dag, n=sample.size)
 ```
 In the case of simulations, we know the relationships between variables prior to creating a model. As such, we can visualize the underlying variable relationships through a DAG. 
 
@@ -92,6 +84,8 @@ logistic.regression <- glm(X ~ Z1 + I(Z1^2) + Z2 + I(Z2^2) + V + I(V^2),
 sim1.data <- sim1.data %>% 
   mutate(logreg.fitted = logistic.regression$fitted.values)
 ```
+
+Now, I will use a single decision tree to model the probability of treatment. 
 ```{r CART}
 regression.tree <- rpart(X ~ Z1 + I(Z1^2) + Z2 + I(Z2^2) + V + I(V^2), data = sim1.data, method = "class")
 predictions <- predict(regression.tree, type = "prob")[,2]
@@ -99,6 +93,8 @@ predictions <- predict(regression.tree, type = "prob")[,2]
 sim1.data <- sim1.data %>% 
   mutate(regtree.fitted = predictions)
 ```
+
+Now, I model the probability of treatment using a random forest. 
 ```{r random forest}
 preds <- sim1.data[,c(2,3,5)]
 resp <- as.factor(sim1.data[,6])
@@ -113,7 +109,155 @@ rf.predictions <- predict(random.forest, type = "prob")[,2]
 sim1.data <- sim1.data %>% 
   mutate(rf.fitted = rf.predictions)
 ```
-```{r}
+
+
+```{r gbm}
+fitcontrol <- trainControl(method = "repeatedcv", 
+                           number = 10, 
+                           repeats = 10)
+gbm <- train(as.factor(X) ~ Z1 + Z2 + V, 
+             data = sim1.data, 
+             method = "gbm", 
+             trControl = fitcontrol, 
+             verbose =FALSE)
+
+sim1.data <- sim1.data %>% 
+  mutate(gbm.fitted = predict(gbm, type = "prob")[,2])
 
 ```
+Now, I will calculate the initial bias, post-stratification bias, and resulting bias reduction. 
+```{r}
+# initial bias, prior to subclassification
+b1.regtree <- mean(sim1.data$logreg.fitted[sim1.data$X == 1]) - mean(sim1.data$logreg.fitted[sim1.data$X == 0])
+b1.regtree <- mean(sim1.data$regtree.fitted[sim1.data$X == 1]) - mean(sim1.data$regtree.fitted[sim1.data$X == 0])
+b1.rf <- mean(sim1.data$rf.fitted[sim1.data$X == 1]) - mean(sim1.data$rf.fitted[sim1.data$X == 0])
+b1.gbm <- mean(sim1.data$gbm.fitted[sim1.data$X == 1]) - mean(sim1.data$gbm.fitted[sim1.data$X == 0])
+
+# create strata and assign each observation 
+sim1.data <- sim1.data %>% 
+  mutate(decile.logreg = cut(logreg.fitted, breaks = 10, labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")), 
+         decile.regtree = cut(regtree.fitted, breaks = 10, labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")), 
+         decile.rf = cut(rf.fitted, breaks = 10, labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")),
+         decile.gbm = cut(gbm.fitted, breaks = 10, labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")))
+
+# calculate post-stratification bias 
+expect.decile.logreg <- seq(1,10, by = 1)
+expect.decile.regtree <- seq(1,10, by = 1)
+expect.decile.rf <- seq(1,10, by = 1)
+expect.decile.gbm <- seq(1,10, by = 1)
+
+TE.logreg <- rep(0, 10)
+CE.logreg <- rep(0,10)
+TE.regtree <- rep(0,10)
+CE.regtree <- rep(0,10)
+TE.rf <- rep(0,10)
+CE.rf <- rep(0,10)
+TE.gbm <- rep(0,10)
+CE.gbm <- rep(0,10)
+
+
+for(i in 1:length(expect.decile.logreg)){
+  
+  expect.decile.logreg[i] <- ifelse(length(sim1.data$logreg.fitted[sim1.data$X == 1 & sim1.data$decile.logreg == i]) == 0 || length(sim1.data$logreg.fitted[sim1.data$X == 0 & sim1.data$decile.logreg == i]) == 0, 0, mean(sim1.data$logreg.fitted[sim1.data$X == 1 & sim1.data$decile.logreg == i]) - mean(sim1.data$logreg.fitted[sim1.data$X == 0 & sim1.data$decile.logreg == i]))
+  
+  TE.logreg[i] <- ifelse(length(sim1.data$logreg.fitted[sim1.data$X == 1 & sim1.data$decile.logreg == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 1 & sim1.data$decile.logreg == i]))
+  
+  CE.logreg[i] <- ifelse(length(sim1.data$logreg.fitted[sim1.data$X == 0 & sim1.data$decile.logreg == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 0 & sim1.data$decile.logreg == i]))
+  
+  expect.decile.regtree[i] <- ifelse(length(sim1.data$regtree.fitted[sim1.data$X == 1 & sim1.data$decile.regtree == i]) == 0 || length(sim1.data$regtree.fitted[sim1.data$X == 0 & sim1.data$decile.regtree == i]) == 0, 0, mean(sim1.data$regtree.fitted[sim1.data$X == 1 & sim1.data$decile.regtree == i]) - mean(sim1.data$regtree.fitted[sim1.data$X == 0 & sim1.data$decile.regtree == i]))
+  
+  TE.regtree[i] <- ifelse(length(sim1.data$regtree.fitted[sim1.data$X == 1 & sim1.data$decile.regtree == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 1 & sim1.data$decile.regtree == i]))
+  
+  CE.regtree[i] <- ifelse(length(sim1.data$regtree.fitted[sim1.data$X == 0 & sim1.data$decile.regtree == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 0 & sim1.data$decile.regtree == i]))
+  
+  expect.decile.rf[i] <- ifelse(length(sim1.data$rf.fitted[sim1.data$X == 1 & sim1.data$decile.rf == i]) == 0 || length(sim1.data$rf.fitted[sim1.data$X == 0 & sim1.data$decile.rf == i]) == 0, 0, mean(sim1.data$rf.fitted[sim1.data$X == 1 & sim1.data$decile.rf == i]) - mean(sim1.data$rf.fitted[sim1.data$X == 0 & sim1.data$decile.rf == i]))
+  
+  TE.rf[i] <- ifelse(length(sim1.data$rf.fitted[sim1.data$X == 1 & sim1.data$decile.rf == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 1 & sim1.data$decile.rf == i]))
+  
+  CE.rf[i] <- ifelse(length(sim1.data$rf.fitted[sim1.data$X == 0 & sim1.data$decile.rf == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 0 & sim1.data$decile.rf == i]))
+  
+  expect.decile.gbm[i] <- ifelse(length(sim1.data$gbm.fitted[sim1.data$X == 1 & sim1.data$decile.gbm == i]) == 0 || length(sim1.data$gbm.fitted[sim1.data$X == 0 & sim1.data$decile.gbm == i]) == 0, 0, mean(sim1.data$gbm.fitted[sim1.data$X == 1 & sim1.data$decile.gbm == i]) - mean(sim1.data$gbm.fitted[sim1.data$X == 0 & sim1.data$decile.gbm == i]))
+  
+  TE.gbm[i] <- ifelse(length(sim1.data$gbm.fitted[sim1.data$X == 1 & sim1.data$decile.gbm == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 1 & sim1.data$decile.gbm == i]))
+  
+  CE.gbm[i] <- ifelse(length(sim1.data$gbm.fitted[sim1.data$X == 0 & sim1.data$decile.gbm == i]) == 0, 0, mean(sim1.data$Y[sim1.data$X == 0 & sim1.data$decile.gbm == i]))
+  
+}
+
+
+b2.logreg <- sum(expect.decile.logreg)
+b2.regtree <- sum(expect.decile.regtree)
+b2.rf <- sum(expect.decile.rf)
+b2.gbm <- sum(expect.decile.gbm)
+
+reduction.logreg <- (1 - b2.logreg/b1.logreg)*100
+reduction.regtree <- (1 - b2.regtree/b1.regtree)*100 
+reduction.rf <- (1 - b2.rf/b1.rf)*100
+reduction.gbm <- (1 - b2.gbm/b1.gbm)*100
+
+# count obs by decile in treatment vs. control group 
+treatment.nobs.logreg <- sim1.data %>% 
+  filter(X==1) %>% 
+  group_by(decile.logreg) %>% 
+  count()
+
+control.nobs.logreg <- sim1.data %>% 
+  filter(X == 0) %>% 
+  group_by(decile.logreg) %>% 
+  count()
+
+treatment.nobs.regtree <- sim1.data %>% 
+  filter(X==1) %>% 
+  group_by(decile.regtree) %>% 
+  count()
+
+control.nobs.regtree <- sim1.data %>% 
+  filter(X==0) %>% 
+  group_by(decile.regtree) %>% 
+  count()
+
+treatment.nobs.rf <- sim1.data %>% 
+  filter(X==1) %>% 
+  group_by(decile.rf) %>% 
+  count()
+
+control.nobs.rf <- sim1.data %>% 
+  filter(X==0) %>% 
+  group_by(decile.rf) %>% 
+  count()
+
+treatment.nobs.gbm <- sim1.data %>% 
+  filter(X==1) %>% 
+  group_by(decile.gbm) %>% 
+  count()
+
+control.nobs.gbm <- sim1.data %>% 
+  filter(X==0) %>% 
+  group_by(decile.gbm) %>% 
+  count()
+```
+
+Now, I will focus on calculating the Average Treatment Effect. 
+
+```{r}
+# add the first decile to df
+row <- data.frame(1,0)
+names(row) <- c("decile.logreg", "n")
+treatment.nobs.logreg <- treatment.nobs.logreg[-2,]
+treatment.nobs.logreg <- rbind(row, treatment.nobs.logreg)
+
+row2 <- data.frame(1,0)
+names(row2) <- c("decile.gbm", "n")
+treatment.nobs.gbm <- rbind(row2, treatment.nobs.gbm)
+
+ATE.logreg <- sum((treatment.nobs.logreg[,2] + control.nobs.logreg[,2])*(TE.logreg - CE.logreg))/sample.size
+
+ATE.regtree <- sum((treatment.nobs.regtree[,2] + control.nobs.regtree[,2])*(TE.regtree - CE.regtree))/sample.size
+
+ATE.rf <- sum((treatment.nobs.rf[,2] + control.nobs.rf[,2])*(TE.rf - CE.rf))/sample.size
+
+ATE.gbm <- sum((treatment.nobs.gbm[,2] + control.nobs.gbm[,2])*(TE.gbm - CE.gbm))/sample.size
+```
+It seems as though a single regression tree is able to extract the causal relationship most effectively in terms of both bias reduction and accuractly of treatment effect. 
+
 
